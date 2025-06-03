@@ -36,7 +36,8 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
     scalar_t
         *__restrict__ render_colors, // [I, image_height, image_width, CDIM]
     scalar_t *__restrict__ render_alphas, // [I, image_height, image_width, 1]
-    int32_t *__restrict__ last_ids        // [I, image_height, image_width]
+    int32_t *__restrict__ last_ids,        // [I, image_height, image_width]
+    int32_t *__restrict__ n_touched       // [I, N, 1]
 ) {
     // each thread draws one pixel, but also timeshares caching gaussians in a
     // shared tile
@@ -52,6 +53,7 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
     render_colors += image_id * image_height * image_width * CDIM;
     render_alphas += image_id * image_height * image_width;
     last_ids += image_id * image_height * image_width;
+    // n_touched += image_id * N;
     if (backgrounds != nullptr) {
         backgrounds += image_id * CDIM;
     }
@@ -157,6 +159,11 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
             }
 
             int32_t g = id_batch[t];
+            
+            if (next_T > 0.5f) {
+                atomicAdd(&n_touched[g], 1);
+            }
+
             const float vis = alpha * T;
             const float *c_ptr = colors + g * CDIM;
 #pragma unroll
@@ -206,7 +213,8 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
     // outputs
     at::Tensor renders, // [..., image_height, image_width, channels]
     at::Tensor alphas,  // [..., image_height, image_width]
-    at::Tensor last_ids // [..., image_height, image_width]
+    at::Tensor last_ids, // [..., image_height, image_width]
+    at::Tensor n_touched // [..., N, 1]
 ) {
     bool packed = means2d.dim() == 2;
 
@@ -261,7 +269,8 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
             flatten_ids.data_ptr<int32_t>(),
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
-            last_ids.data_ptr<int32_t>()
+            last_ids.data_ptr<int32_t>(),
+            n_touched.data_ptr<int32_t>()
         );
 }
 
@@ -283,7 +292,8 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
         const at::Tensor flatten_ids,                                          \
         at::Tensor renders,                                                    \
         at::Tensor alphas,                                                     \
-        at::Tensor last_ids                                                    \
+        at::Tensor last_ids,                                                   \
+        at::Tensor n_touched                                                   \
     );
 
 __INS__(1)
