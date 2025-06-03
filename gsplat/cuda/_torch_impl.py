@@ -587,6 +587,12 @@ def accumulate(
     weights, trans = render_weight_from_alpha(
         alphas, ray_indices=indices, n_rays=total_pixels
     )
+    with torch.no_grad():
+        # n_touched is calculated as: if t * (1 - alpha) > 0.5 then n_touched[image_id, gaussian_id] += 1
+        n_touched = torch.zeros(alphas.shape, device=alphas.device)
+        n_touched = (trans * (1 - alphas) > 0.5) * 1
+
+
     renders = accumulate_along_rays(
         weights,
         colors[image_ids, gaussian_ids],
@@ -597,7 +603,15 @@ def accumulate(
         weights, None, ray_indices=indices, n_rays=total_pixels
     ).reshape(image_dims + (image_height, image_width, 1))
 
-    return renders, alphas
+
+    # accumulate the number of pixels touched by each Gaussian.
+    gaussian_indices = image_ids * N + gaussian_ids
+    n_touched = accumulate_along_rays(
+        n_touched.flatten(), None, ray_indices=gaussian_indices, n_rays=N*I
+    ).reshape(image_dims + (N,))
+    n_touched = n_touched.to(torch.int)
+
+    return renders, alphas, n_touched
 
 
 def _rasterize_to_pixels(
@@ -661,6 +675,10 @@ def _rasterize_to_pixels(
         image_dims + (image_height, image_width, 1), device=device
     )
 
+    # Accumulate the number of pixels touched by each Gaussian.
+    # [..., N]
+    n_touched = torch.zeros(image_dims + (N,), device=device, dtype=torch.int)
+
     # Split Gaussians into batches and iteratively accumulate the renderings
     block_size = tile_size * tile_size
     isect_offsets_fl = torch.cat(
@@ -690,7 +708,7 @@ def _rasterize_to_pixels(
             break
 
         # Accumulate the renderings within this batch of Gaussians.
-        renders_step, accs_step = accumulate(
+        renders_step, accs_step, n_touched_step = accumulate(
             means2d,
             conics,
             opacities,
@@ -703,14 +721,14 @@ def _rasterize_to_pixels(
         )
         render_colors = render_colors + renders_step * transmittances[..., None]
         render_alphas = render_alphas + accs_step * transmittances[..., None]
-
+        n_touched = n_touched + n_touched_step
     render_alphas = render_alphas
     if backgrounds is not None:
         render_colors = render_colors + backgrounds[..., None, None, :] * (
             1.0 - render_alphas
         )
 
-    return render_colors, render_alphas
+    return render_colors, render_alphas, n_touched
 
 
 def _eval_sh_bases_fast(basis_dim: int, dirs: Tensor):
