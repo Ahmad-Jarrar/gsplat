@@ -1257,6 +1257,7 @@ class _RasterizeToPixels(torch.autograd.Function):
         ctx,
         v_render_colors: Tensor,  # [..., H, W, 3]
         v_render_alphas: Tensor,  # [..., H, W, 1]
+        v_n_touched: Tensor,  # [..., N, 1]
     ):
         (
             means2d,
