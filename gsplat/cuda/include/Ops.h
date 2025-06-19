@@ -523,7 +523,7 @@ rasterize_to_pixels_from_world_3dgs_fwd(
     const at::Tensor flatten_ids   // [n_isects]
 );
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 rasterize_to_pixels_from_world_3dgs_bwd(
     // Gaussian parameters
     const at::Tensor means,                     // [..., N, 3]

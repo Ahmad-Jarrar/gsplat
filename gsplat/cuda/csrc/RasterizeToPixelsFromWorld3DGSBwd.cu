@@ -61,7 +61,9 @@ __global__ void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
     vec4 *__restrict__ v_quats,        // [B, N, 4]
     vec3 *__restrict__ v_scales,       // [B, N, 3]
     scalar_t *__restrict__ v_colors,   // [B, C, N, CDIM] or [nnz, CDIM]
-    scalar_t *__restrict__ v_opacities // [B, C, N] or [nnz]
+    scalar_t *__restrict__ v_opacities, // [B, C, N] or [nnz]
+    scalar_t *__restrict__ v_viewmats0, // [B, C, 4, 4] World to Camera
+    scalar_t *__restrict__ v_viewmats1 // [B, C, 4, 4] optional for rolling shutter World to Camera
 ) {
     auto block = cg::this_thread_block();
     uint32_t iid = block.group_index().x;
@@ -148,6 +150,8 @@ __global__ void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
         assert(false);
         return;
     }
+
+    // World Ray
     const vec3 ray_d = ray.ray_dir;
     const vec3 ray_o = ray.ray_org;
 
@@ -270,10 +274,13 @@ __global__ void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
                 );
                 Mt = glm::transpose(R * S);
                 o_minus_mu = ray_o - xyz;
+                // Convert to canonical gaussian frame (o_g, d_g, d_g/norm_d_g)
                 gro = Mt * o_minus_mu;
                 grd = Mt * ray_d;
                 grd_n = safe_normalize(grd);
+
                 gcrod = glm::cross(grd_n, gro);
+                // w_g^2
                 grayDist = glm::dot(gcrod, gcrod);
                 power = -0.5f * grayDist;
 
@@ -292,6 +299,10 @@ __global__ void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
             vec3 v_mean_local = {0.f, 0.f, 0.f};
             vec3 v_scale_local = {0.f, 0.f, 0.f};
             vec4 v_quat_local = {0.f, 0.f, 0.f, 0.f};
+            glm::fquat v_pose_quat_0_local = {0.f, 0.f, 0.f, 0.f};
+            glm::fquat v_pose_quat_1_local = {0.f, 0.f, 0.f, 0.f};
+            vec3 v_pose_t_0_local = {0.f, 0.f, 0.f};
+            vec3 v_pose_t_1_local = {0.f, 0.f, 0.f};
             float v_opacity_local = 0.f;
             // initialize everything to 0, only set if the lane is valid
             if (valid) {
@@ -333,6 +344,67 @@ __global__ void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
                     mat3 v_Mt = glm::outerProduct(v_grd, ray_d) + 
                         glm::outerProduct(v_gro, o_minus_mu);
                     vec3 v_o_minus_mu = glm::transpose(Mt) * v_gro;
+                    vec3 v_ray_d_world = glm::transpose(Mt) * v_grd;
+                    vec3 v_ray_o_world = v_o_minus_mu;
+
+                    // Gradient from ray origin and ray direction to viewmat0 and viewmat1 using camera model
+                    // Redundant code, but keep it for now, cannot calculate the gradient earlier as it is non linear
+                    // Major performance bottleneck
+                    if (camera_model_type == CameraModelType::PINHOLE) {
+                        if (radial_coeffs == nullptr && tangential_coeffs == nullptr && thin_prism_coeffs == nullptr) {
+                            PerfectPinholeCameraModel::Parameters cm_params_bwd = {};
+                            cm_params_bwd.resolution = {image_width, image_height};
+                            cm_params_bwd.shutter_type = rs_type;
+                            cm_params_bwd.principal_point = { principal_point.x, principal_point.y };
+                            cm_params_bwd.focal_length = { focal_length.x, focal_length.y };
+                            PerfectPinholeCameraModel camera_model_bwd(cm_params_bwd);
+                            auto [v_q_start_grad, v_t_start_grad, v_q_end_grad, v_t_end_grad] = camera_model_bwd.image_point_to_world_ray_shutter_pose_backward(vec2(px, py), rs_params, v_ray_o_world, v_ray_d_world);
+                            v_pose_quat_0_local = v_q_start_grad;
+                            v_pose_quat_1_local = v_q_end_grad;
+                            v_pose_t_0_local = v_t_start_grad;
+                            v_pose_t_1_local = v_t_end_grad;
+                        } else {
+                            OpenCVPinholeCameraModel<>::Parameters cm_params_bwd = {};
+                            cm_params_bwd.resolution = {image_width, image_height};
+                            cm_params_bwd.shutter_type = rs_type;
+                            cm_params_bwd.principal_point = { principal_point.x, principal_point.y };
+                            cm_params_bwd.focal_length = { focal_length.x, focal_length.y };
+                            if (radial_coeffs != nullptr) {
+                                cm_params_bwd.radial_coeffs = make_array<float, 6>(radial_coeffs + iid * 6);
+                            }
+                            if (tangential_coeffs != nullptr) {
+                                cm_params_bwd.tangential_coeffs = make_array<float, 2>(tangential_coeffs + iid * 2);
+                            }
+                            if (thin_prism_coeffs != nullptr) {
+                                cm_params_bwd.thin_prism_coeffs = make_array<float, 4>(thin_prism_coeffs + iid * 4);
+                            }
+                            OpenCVPinholeCameraModel camera_model_bwd(cm_params_bwd);
+                            auto [v_q_start_grad, v_t_start_grad, v_q_end_grad, v_t_end_grad] = camera_model_bwd.image_point_to_world_ray_shutter_pose_backward(vec2(px, py), rs_params, v_ray_o_world, v_ray_d_world);
+                            v_pose_quat_0_local = v_q_start_grad;
+                            v_pose_quat_1_local = v_q_end_grad;
+                            v_pose_t_0_local = v_t_start_grad;
+                            v_pose_t_1_local = v_t_end_grad;
+                        }
+                    } else if (camera_model_type == CameraModelType::FISHEYE) {
+                        OpenCVFisheyeCameraModel<>::Parameters cm_params_bwd = {};
+                        cm_params_bwd.resolution = {image_width, image_height};
+                        cm_params_bwd.shutter_type = rs_type;
+                        cm_params_bwd.principal_point = { principal_point.x, principal_point.y };
+                        cm_params_bwd.focal_length = { focal_length.x, focal_length.y };
+                        if (radial_coeffs != nullptr) {
+                            cm_params_bwd.radial_coeffs = make_array<float, 4>(radial_coeffs + iid * 4);
+                        }
+                        OpenCVFisheyeCameraModel camera_model_bwd(cm_params_bwd);
+                        auto [v_q_start_grad, v_t_start_grad, v_q_end_grad, v_t_end_grad] = camera_model_bwd.image_point_to_world_ray_shutter_pose_backward(vec2(px, py), rs_params, v_ray_o_world, v_ray_d_world);
+                        v_pose_quat_0_local = v_q_start_grad;
+                        v_pose_quat_1_local = v_q_end_grad;
+                        v_pose_t_0_local = v_t_start_grad;
+                        v_pose_t_1_local = v_t_end_grad;
+                    } else {
+                        // should never reach here
+                        assert(false);
+                        return;
+                    }
 
                     v_mean_local += -v_o_minus_mu;
                     quat_scale_to_preci_half_vjp(
@@ -351,10 +423,15 @@ __global__ void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
             warpSum(v_scale_local, warp);
             warpSum(v_quat_local, warp);
             warpSum(v_opacity_local, warp);
+            warpSum(v_pose_quat_0_local, warp);
+            warpSum(v_pose_quat_1_local, warp);
+            warpSum(v_pose_t_0_local, warp);
+            warpSum(v_pose_t_1_local, warp);
+
             if (warp.thread_rank() == 0) {
                 int32_t isect_id = id_batch[t]; // flatten index in [B * C * N] or [nnz]
                 int32_t isect_bid = isect_id / (C * N);   // intersection batch index
-                // int32_t isect_cid = (isect_id / N) % C;   // intersection camera index
+                int32_t isect_cid = (isect_id / N) % C;   // intersection camera index
                 int32_t isect_gid = isect_id % N;         // intersection gaussian index
                 float *v_rgb_ptr = (float *)(v_colors) + CDIM * isect_id;
 #pragma unroll
@@ -379,6 +456,57 @@ __global__ void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
                 gpuAtomicAdd(v_quat_ptr + 3, v_quat_local.w);
 
                 gpuAtomicAdd(v_opacities + isect_id, v_opacity_local);
+
+                // Convert to valid quat
+                // Project gradients to tangent space to maintain unit norm
+                v_pose_quat_0_local = quat_to_tangent_space(rs_params.q_start, v_pose_quat_0_local);
+                v_pose_quat_1_local = quat_to_tangent_space(rs_params.q_end, v_pose_quat_1_local);
+                // Convert to viewmat0 and viewmat1
+                mat3 v_pose_r_0_grad = quaternion_gradient_to_rotation_matrix_gradient(rs_params.q_start, v_pose_quat_0_local);
+                mat3 v_pose_r_1_grad = quaternion_gradient_to_rotation_matrix_gradient(rs_params.q_end, v_pose_quat_1_local);
+
+                mat4 v_viewmat0_grad = pack_gradients_into_view_matrix(v_pose_r_0_grad, v_pose_t_0_local);
+                mat4 v_viewmat1_grad = pack_gradients_into_view_matrix(v_pose_r_1_grad, v_pose_t_1_local);
+
+                // Write to the global memory
+                float *v_viewmat0_ptr = (float *)(v_viewmats0) + 16 * (isect_bid * C + isect_cid);
+                float *v_viewmat1_ptr = (float *)(v_viewmats1) + 16 * (isect_bid * C + isect_cid);
+
+                // Need to write 4x4 matrix to global memory
+                gpuAtomicAdd(v_viewmat0_ptr, v_viewmat0_grad[0][0]);
+                gpuAtomicAdd(v_viewmat0_ptr + 1, v_viewmat0_grad[0][1]);
+                gpuAtomicAdd(v_viewmat0_ptr + 2, v_viewmat0_grad[0][2]);
+                gpuAtomicAdd(v_viewmat0_ptr + 3, v_viewmat0_grad[0][3]);
+                gpuAtomicAdd(v_viewmat0_ptr + 4, v_viewmat0_grad[1][0]);
+                gpuAtomicAdd(v_viewmat0_ptr + 5, v_viewmat0_grad[1][1]);
+                gpuAtomicAdd(v_viewmat0_ptr + 6, v_viewmat0_grad[1][2]);
+                gpuAtomicAdd(v_viewmat0_ptr + 7, v_viewmat0_grad[1][3]);
+                gpuAtomicAdd(v_viewmat0_ptr + 8, v_viewmat0_grad[2][0]);
+                gpuAtomicAdd(v_viewmat0_ptr + 9, v_viewmat0_grad[2][1]);
+                gpuAtomicAdd(v_viewmat0_ptr + 10, v_viewmat0_grad[2][2]);
+                gpuAtomicAdd(v_viewmat0_ptr + 11, v_viewmat0_grad[2][3]);
+                gpuAtomicAdd(v_viewmat0_ptr + 12, v_viewmat0_grad[3][0]);
+                gpuAtomicAdd(v_viewmat0_ptr + 13, v_viewmat0_grad[3][1]);
+                gpuAtomicAdd(v_viewmat0_ptr + 14, v_viewmat0_grad[3][2]);
+                gpuAtomicAdd(v_viewmat0_ptr + 15, v_viewmat0_grad[3][3]);
+
+
+                gpuAtomicAdd(v_viewmat1_ptr, v_viewmat1_grad[0][0]);
+                gpuAtomicAdd(v_viewmat1_ptr + 1, v_viewmat1_grad[0][1]);
+                gpuAtomicAdd(v_viewmat1_ptr + 2, v_viewmat1_grad[0][2]);
+                gpuAtomicAdd(v_viewmat1_ptr + 3, v_viewmat1_grad[0][3]);
+                gpuAtomicAdd(v_viewmat1_ptr + 4, v_viewmat1_grad[1][0]);
+                gpuAtomicAdd(v_viewmat1_ptr + 5, v_viewmat1_grad[1][1]);
+                gpuAtomicAdd(v_viewmat1_ptr + 6, v_viewmat1_grad[1][2]);
+                gpuAtomicAdd(v_viewmat1_ptr + 7, v_viewmat1_grad[1][3]);
+                gpuAtomicAdd(v_viewmat1_ptr + 8, v_viewmat1_grad[2][0]);
+                gpuAtomicAdd(v_viewmat1_ptr + 9, v_viewmat1_grad[2][1]);
+                gpuAtomicAdd(v_viewmat1_ptr + 10, v_viewmat1_grad[2][2]);
+                gpuAtomicAdd(v_viewmat1_ptr + 11, v_viewmat1_grad[2][3]);
+                gpuAtomicAdd(v_viewmat1_ptr + 12, v_viewmat1_grad[3][0]);
+                gpuAtomicAdd(v_viewmat1_ptr + 13, v_viewmat1_grad[3][1]);
+                gpuAtomicAdd(v_viewmat1_ptr + 14, v_viewmat1_grad[3][2]);
+                gpuAtomicAdd(v_viewmat1_ptr + 15, v_viewmat1_grad[3][3]);
             }
         }
     }
@@ -423,7 +551,9 @@ void launch_rasterize_to_pixels_from_world_3dgs_bwd_kernel(
     at::Tensor v_quats,      // [..., N, 4]
     at::Tensor v_scales,     // [..., N, 3]
     at::Tensor v_colors,     // [..., C, N, 3] or [nnz, 3]
-    at::Tensor v_opacities   // [..., C, N] or [nnz]
+    at::Tensor v_opacities,  // [..., C, N] or [nnz]
+    at::Tensor v_viewmats0,  // [..., C, 4, 4]
+    at::Tensor v_viewmats1   // [..., C, 4, 4]
 ) {
     bool packed = opacities.dim() == 1;
     assert (packed == false); // only support non-packed for now
@@ -514,7 +644,9 @@ void launch_rasterize_to_pixels_from_world_3dgs_bwd_kernel(
             reinterpret_cast<vec4 *>(v_quats.data_ptr<float>()),
             reinterpret_cast<vec3 *>(v_scales.data_ptr<float>()),
             v_colors.data_ptr<float>(),
-            v_opacities.data_ptr<float>()
+            v_opacities.data_ptr<float>(),
+            v_viewmats0.data_ptr<float>(),
+            v_viewmats1.data_ptr<float>()
         );
 }
 
@@ -552,7 +684,9 @@ void launch_rasterize_to_pixels_from_world_3dgs_bwd_kernel(
         at::Tensor v_quats,                                                    \
         at::Tensor v_scales,                                                   \
         at::Tensor v_colors,                                                   \
-        at::Tensor v_opacities                                                 \
+        at::Tensor v_opacities,                                                \
+        at::Tensor v_viewmats0,                                                \
+        at::Tensor v_viewmats1                                                 \
     );
 
 __INS__(1)

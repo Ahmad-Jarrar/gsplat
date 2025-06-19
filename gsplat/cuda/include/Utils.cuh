@@ -102,6 +102,13 @@ template <class WarpT> inline __device__ void warpSum(vec4 &val, WarpT &warp) {
     val.w = cg::reduce(warp, val.w, cg::plus<float>());
 }
 
+template <class WarpT> inline __device__ void warpSum(quat &val, WarpT &warp) {
+    val.x = cg::reduce(warp, val.x, cg::plus<float>());
+    val.y = cg::reduce(warp, val.y, cg::plus<float>());
+    val.z = cg::reduce(warp, val.z, cg::plus<float>());
+    val.w = cg::reduce(warp, val.w, cg::plus<float>());
+}
+
 template <class WarpT> inline __device__ void warpSum(vec3 &val, WarpT &warp) {
     val.x = cg::reduce(warp, val.x, cg::plus<float>());
     val.y = cg::reduce(warp, val.y, cg::plus<float>());
@@ -769,6 +776,28 @@ inline __device__ vec3 safe_normalize_bw(const vec3 &v, const vec3 &d_out) {
         return il * d_out - il3 * glm::dot(d_out, v) * v;
     }
     return d_out;
+}
+
+inline __device__ mat4 pack_gradients_into_view_matrix(
+    const mat3 &grad_R,
+    const vec3 &grad_t
+) {
+    mat4 grad_V(0.0f);  // Row-major layout assumed
+
+    // Fill top-left 3x3 block
+    for (int row = 0; row < 3; ++row) {
+        for (int col = 0; col < 3; ++col) {
+            grad_V[row][col] = grad_R[row][col];  // row-major
+        }
+    }
+
+    // Fill right-most column (i.e., last element of each row)
+    for (int row = 0; row < 3; ++row) {
+        grad_V[row][3] = grad_t[row];  // translation part
+    }
+
+    // Bottom row stays [0 0 0 0] (not [0 0 0 1] since this is a gradient)
+    return grad_V;
 }
 
 } // namespace gsplat

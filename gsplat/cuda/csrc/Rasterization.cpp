@@ -816,7 +816,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_from_world_3d
 };
 
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 rasterize_to_pixels_from_world_3dgs_bwd(
     // Gaussian parameters
     const at::Tensor means,  // [..., N, 3]
@@ -877,6 +877,8 @@ rasterize_to_pixels_from_world_3dgs_bwd(
     at::Tensor v_scales = at::zeros_like(scales);
     at::Tensor v_colors = at::zeros_like(colors);
     at::Tensor v_opacities = at::zeros_like(opacities);
+    at::Tensor v_viewmats0 = at::zeros_like(viewmats0);
+    at::Tensor v_viewmats1 = viewmats1.has_value() ? at::zeros_like(viewmats1.value()) : at::zeros_like(viewmats0);
 
 #define __LAUNCH_KERNEL__(N)                                                   \
     case N:                                                                    \
@@ -910,7 +912,9 @@ rasterize_to_pixels_from_world_3dgs_bwd(
             v_quats,                                                           \
             v_scales,                                                          \
             v_colors,                                                          \
-            v_opacities                                                        \
+            v_opacities,                                                       \
+            v_viewmats0,                                                       \
+            v_viewmats1                                                        \
         );                                                                     \
         break;
 
@@ -943,7 +947,7 @@ rasterize_to_pixels_from_world_3dgs_bwd(
 #undef __LAUNCH_KERNEL__
 
     return std::make_tuple(
-        v_means, v_quats, v_scales, v_colors, v_opacities
+        v_means, v_quats, v_scales, v_colors, v_opacities, v_viewmats0, v_viewmats1
     );
 }
 

@@ -1446,7 +1446,7 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
         camera_model_type = ctx.camera_model_type
         tile_size = ctx.tile_size
 
-        (v_means, v_quats, v_scales, v_colors, v_opacities,) = _make_lazy_cuda_func(
+        (v_means, v_quats, v_scales, v_colors, v_opacities, v_viewmats0, v_viewmats1) = _make_lazy_cuda_func(
             "rasterize_to_pixels_from_world_3dgs_bwd"
         )(
             means,
@@ -1483,8 +1483,22 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
         else:
             v_backgrounds = None
 
-        if ctx.needs_input_grad[7]:  # viewmats
-            raise NotImplementedError
+        # if ctx.needs_input_grad[7]:
+        #     print("viewmats requires grad is not implemented")
+
+        if viewmats_rs is None: # global shutter (viewmat0 represents starting ans stopping position)
+            v_viewmats0 += v_viewmats1
+            v_viewmats1 = None
+
+        # if v_viewmats0 is not None:
+        #     print("v_viewmats0 shape:", v_viewmats0.shape)
+        #     print("v_viewmats0", v_viewmats0)
+        # else:
+        #     print("v_viewmats0 is None")
+        # if v_viewmats1 is not None:
+        #     print("v_viewmats1 shape:", v_viewmats1.shape)
+        # else:
+        #     print("v_viewmats1 is None")
 
         return (
             v_means,
@@ -1494,8 +1508,8 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
             v_opacities,
             v_backgrounds,
             None,
-            None,
-            None,
+            v_viewmats0,
+            v_viewmats1,
             None,
             None,
             None,

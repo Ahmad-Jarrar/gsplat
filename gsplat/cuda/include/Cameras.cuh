@@ -30,6 +30,175 @@ __device__ std::array<T, N> make_array(const T *ptr) {
     return arr;
 }
 
+inline __device__ glm::quat quat_to_tangent_space(const glm::quat& q, const glm::quat& grad_q) {
+    glm::quat q_norm = glm::normalize(q);
+    return grad_q - glm::dot(q_norm, grad_q) * q_norm;
+}
+
+inline __device__ std::tuple<glm::quat, glm::quat> slerp_backward(
+    const glm::quat& q0_input, const glm::quat& q1_input, float t, const glm::quat& grad_output
+) {
+    /*
+    More robust SLERP backward pass with proper gradient computation.
+    */
+    
+    glm::quat q0 = glm::normalize(q0_input);
+    glm::quat q1 = glm::normalize(q1_input);
+    float dot = glm::dot(q0, q1);
+
+    // Handle antipodal quaternions (choose shorter path)
+    bool flip = dot < 0.0f;
+    if (flip) {
+        q1 = -q1;
+        dot = -dot;
+    }
+
+    // Clamp to avoid numerical issues
+    dot = glm::clamp(dot, -1.0f, 1.0f);
+
+    // Near-parallel case (linear interpolation)
+    if (dot > 0.9995f) {
+        glm::quat grad_q0 = (1.0f - t) * grad_output;
+        glm::quat grad_q1 = t * grad_output;
+        if (flip) grad_q1 = -grad_q1;
+        return {grad_q0, grad_q1};
+    }
+
+    float theta = acosf(dot);
+    float sin_theta = sinf(theta);
+    float cos_theta = cosf(theta);
+
+    float s0 = sinf((1.0f - t) * theta) / sin_theta;
+    float s1 = sinf(t * theta) / sin_theta;
+
+    float grad_s0 = glm::dot(grad_output, q0);
+    float grad_s1 = glm::dot(grad_output, q1);
+
+    float dtheta_ds0 = (1.0f - t) * cosf((1.0f - t) * theta) / sin_theta - s0 * cos_theta / sin_theta;
+    float dtheta_ds1 = t * cosf(t * theta) / sin_theta - s1 * cos_theta / sin_theta;
+
+    float grad_theta = grad_s0 * dtheta_ds0 + grad_s1 * dtheta_ds1;
+
+    float grad_dot = -grad_theta * rsqrtf(1.0f - dot * dot);
+
+    glm::quat grad_q0 = s0 * grad_output + grad_dot * q1;
+    glm::quat grad_q1 = s1 * grad_output + grad_dot * q0;
+
+    if (flip) grad_q1 = -grad_q1;
+
+    return {grad_q0, grad_q1};
+}
+
+inline __device__ glm::fquat rotation_matrix_gradient_to_quaternion_gradient(
+    glm::fquat const &q_param,
+    glm::fmat3 const &grad_R
+) {
+    /**
+     * Compute the gradient of rotation matrix R with respect to loss,
+     * given quaternion q and gradient of loss with respect to quaternion.
+     * 
+     * This accounts for the normalization constraint ||q|| = 1.
+     * 
+     * @param q_param quaternion [x, y, z, w] (normalized)
+     * @param grad_R gradient of loss w.r.t. rotation matrix (3x3)
+     * @return gradient of loss w.r.t. quaternion [dx, dy, dz, dw]
+     */
+     
+    float x = q_param.x, y = q_param.y, z = q_param.z, w = q_param.w;
+    
+    // Jacobian matrix J: dR/dq (9x4 matrix, stored as 4x9 for easier access)
+    float J[4][9];
+    
+    // dR00/dq through dR22/dq
+    J[0][0] = 0;     J[1][0] = -4*y;  J[2][0] = -4*z;  J[3][0] = 0;      // dR00/dq
+    J[0][1] = 2*y;   J[1][1] = 2*x;   J[2][1] = -2*w;  J[3][1] = -2*z;   // dR01/dq
+    J[0][2] = 2*z;   J[1][2] = 2*w;   J[2][2] = 2*x;   J[3][2] = 2*y;    // dR02/dq
+    J[0][3] = 2*y;   J[1][3] = 2*x;   J[2][3] = 2*w;   J[3][3] = 2*z;    // dR10/dq
+    J[0][4] = -4*x;  J[1][4] = 0;     J[2][4] = -4*z;  J[3][4] = 0;      // dR11/dq
+    J[0][5] = -2*w;  J[1][5] = 2*z;   J[2][5] = 2*y;   J[3][5] = -2*x;   // dR12/dq
+    J[0][6] = 2*z;   J[1][6] = -2*w;  J[2][6] = 2*x;   J[3][6] = -2*y;   // dR20/dq
+    J[0][7] = 2*w;   J[1][7] = 2*z;   J[2][7] = 2*y;   J[3][7] = 2*x;    // dR21/dq
+    J[0][8] = -4*x;  J[1][8] = -4*y;  J[2][8] = 0;     J[3][8] = 0;      // dR22/dq
+    
+    // Flatten grad_R and compute J^T @ grad_R_flat
+    float grad_R_flat[9] = {
+        grad_R[0][0], grad_R[0][1], grad_R[0][2],
+        grad_R[1][0], grad_R[1][1], grad_R[1][2], 
+        grad_R[2][0], grad_R[2][1], grad_R[2][2]
+    };
+    
+    glm::fvec4 grad_q_manifold(0.0f);
+    for (int i = 0; i < 4; ++i) {
+        for (int j = 0; j < 9; ++j) {
+            grad_q_manifold[i] += J[i][j] * grad_R_flat[j];
+        }
+    }
+    
+    // Account for normalization in finite differences
+    // For each quaternion component, compute the tangent direction
+    glm::fvec4 grad_q_euclidean(0.0f);
+    for (int i = 0; i < 4; ++i) {
+        glm::fvec4 e_i(0.0f);
+        e_i[i] = 1.0f;
+        
+        // tangent_direction = e_i - q_param * (q_param · e_i)
+        float dot_product = glm::dot(glm::fvec4(q_param.x, q_param.y, q_param.z, q_param.w), e_i);
+        glm::fvec4 tangent_direction = e_i - glm::fvec4(q_param.x, q_param.y, q_param.z, q_param.w) * dot_product;
+        
+        grad_q_euclidean[i] = glm::dot(grad_q_manifold, tangent_direction);
+    }
+    
+    return glm::fquat(grad_q_euclidean.w, grad_q_euclidean.x, grad_q_euclidean.y, grad_q_euclidean.z);
+    // return grad_q_euclidean;
+}
+
+inline __device__ glm::fmat3 quaternion_gradient_to_rotation_matrix_gradient(
+    const glm::fquat &q_param,  // normalized quaternion [x, y, z, w]
+    const glm::fquat &grad_q_input  // dL/dq
+) {
+    float x = q_param.x, y = q_param.y, z = q_param.z, w = q_param.w;
+    float gx = grad_q_input.x, gy = grad_q_input.y, gz = grad_q_input.z, gw = grad_q_input.w;
+
+    // Project grad_q to tangent space to account for constraint ||q|| = 1
+    float dot_qg = x * gx + y * gy + z * gz + w * gw;
+
+    float pgx = gx - dot_qg * x;
+    float pgy = gy - dot_qg * y;
+    float pgz = gz - dot_qg * z;
+    float pgw = gw - dot_qg * w;
+
+    // Compute partials dR/dq
+    glm::fmat3 dR_dx = 2.0f * glm::fmat3(
+        0,      y,      z,
+        y,     -2*x,   -w,
+        z,      w,     -2*x
+    );
+
+    glm::fmat3 dR_dy = 2.0f * glm::fmat3(
+        -2*y,   x,      w,
+        x,      0,      z,
+        -w,     z,     -2*y
+    );
+
+    glm::fmat3 dR_dz = 2.0f * glm::fmat3(
+        -2*z,   -w,     x,
+        w,     -2*z,    y,
+        x,      y,      0
+    );
+
+    glm::fmat3 dR_dw = 2.0f * glm::fmat3(
+        0,     -z,      y,
+        z,      0,     -x,
+        -y,     x,      0
+    );
+
+    // Combine using projected gradient
+    glm::fmat3 grad_R = pgx * dR_dx + pgy * dR_dy + pgz * dR_dz + pgw * dR_dw;
+
+    // Careful: it returns matrix in column-major order
+    return grad_R;
+}
+
 struct RollingShutterParameters {
     glm::fvec3 t_start;
     glm::fquat q_start;
@@ -39,6 +208,7 @@ struct RollingShutterParameters {
     __device__
     RollingShutterParameters(const float *se3_start, const float *se3_end) {
         // input is row-major, but glm is column-major
+        // Input is W2C
         q_start = glm::quat_cast(glm::mat3(
             se3_start[0],
             se3_start[4],
@@ -260,16 +430,46 @@ struct CameraRay {
 struct ShutterPose {
     glm::fvec3 t;
     glm::fquat q;
-
+    
     inline __device__ auto camera_world_position() const -> glm::fvec3 {
         return glm::rotate(glm::inverse(q), -t);
     }
-
-    inline __device__ auto camera_ray_to_world_ray(glm::fvec3 const &camera_ray
-    ) const -> WorldRay {
+    
+    inline __device__ auto camera_ray_to_world_ray(glm::fvec3 const &camera_ray) const -> WorldRay {
+        // w2c rotation -> c2w rotation
         auto const R_inv = glm::mat3_cast(glm::inverse(q));
-
+        // Camera ray origin is at origin of the camera frame
         return {-R_inv * t, R_inv * camera_ray, true};
+    }
+    
+    // Backward pass to compute gradients of camera pose parameters
+    inline __device__ auto camera_ray_to_world_ray_backward(
+        glm::fvec3 const &camera_ray,
+        glm::fvec3 const &grad_world_ray_origin,
+        glm::fvec3 const &grad_world_ray_dir
+    ) const -> std::pair<glm::fvec3, glm::fquat> {
+        
+        auto const R_inv = glm::mat3_cast(glm::inverse(q));
+        auto const R = glm::mat3_cast(q);  // Forward rotation matrix
+        
+        // Gradient for translation t - CORRECTED: use R, not R_inv
+        glm::fvec3 grad_t = -R * grad_world_ray_origin;
+        
+        // Gradient of R_inv matrix
+        glm::fmat3 grad_R_inv = -glm::outerProduct(grad_world_ray_origin, t) +
+                               glm::outerProduct(grad_world_ray_dir, camera_ray);
+        
+        // Convert to gradient w.r.t. quaternion conjugate
+        glm::fquat q_conjugate(-q.x, -q.y, -q.z, q.w);  // q* = [-x, -y, -z, w]
+        glm::fquat grad_q_star = rotation_matrix_gradient_to_quaternion_gradient(q_conjugate, grad_R_inv);
+        
+        // Convert gradient w.r.t. q* to gradient w.r.t. q
+        // Since q* = q * [-1, -1, -1, 1], we have dq*/dq = diag([-1, -1, -1, 1])
+        // glm::fquat grad_q(grad_q_star.w, -grad_q_star.x, -grad_q_star.y, -grad_q_star.z);
+
+        glm::fquat grad_q(grad_q_star.w, -grad_q_star.x, -grad_q_star.y, -grad_q_star.z);
+        
+        return {grad_t, grad_q};
     }
 };
 
@@ -286,6 +486,32 @@ inline __device__ auto interpolate_shutter_pose(
         (1.f - relative_frame_time) * t_start + relative_frame_time * t_end;
     auto const q_rs = glm::normalize(glm::slerp(q_start, q_end, relative_frame_time));
     return ShutterPose{t_rs, q_rs};
+}
+
+
+inline __device__ std::tuple<glm::fquat, glm::fvec3, glm::fquat, glm::fvec3> interpolate_shutter_pose_backward(
+    float t_rel,
+    const RollingShutterParameters& params,
+    const glm::vec3& grad_t_rs,
+    const glm::fquat& grad_q_rs
+) {
+    // Translation backward
+    glm::vec3 grad_t_start = (1.0f - t_rel) * grad_t_rs;
+    glm::vec3 grad_t_end = t_rel * grad_t_rs;
+
+    // Forward SLERP
+    glm::quat q_interp = glm::slerp(params.q_start, params.q_end, t_rel);
+    glm::quat q_rs = glm::normalize(q_interp);
+
+    float dot_qrs = glm::dot(q_rs, grad_q_rs);
+    glm::quat grad_q_interp = grad_q_rs - dot_qrs * q_rs;
+
+    auto [grad_q0_raw, grad_q1_raw] = slerp_backward(params.q_start, params.q_end, t_rel, grad_q_interp);
+
+    glm::quat grad_q0 = quat_to_tangent_space(params.q_start, grad_q0_raw);
+    glm::quat grad_q1 = quat_to_tangent_space(params.q_end, grad_q1_raw);
+
+    return {grad_q0, grad_t_start, grad_q1, grad_t_end};
 }
 
 template <class DerivedCameraModel> struct BaseCameraModel {
@@ -347,6 +573,34 @@ template <class DerivedCameraModel> struct BaseCameraModel {
         )
             .camera_ray_to_world_ray(camera_ray.ray_dir);
     };
+
+    inline __device__ auto image_point_to_world_ray_shutter_pose_backward(
+        glm::fvec2 const &image_point,
+        RollingShutterParameters const &rolling_shutter_parameters,
+        glm::fvec3 const &grad_world_ray_origin,
+        glm::fvec3 const &grad_world_ray_dir
+    ) const -> std::tuple<glm::fquat, glm::fvec3, glm::fquat, glm::fvec3> {
+        auto derived = static_cast<DerivedCameraModel const *>(this);
+
+        auto const camera_ray = derived->image_point_to_camera_ray(image_point);
+        if (!camera_ray.valid_flag) {
+            return {glm::fquat{}, glm::fvec3{}, glm::fquat{}, glm::fvec3{}};
+        }
+        float t_rel = shutter_relative_frame_time(image_point);
+        auto shutter_pose = interpolate_shutter_pose(
+            t_rel,
+            rolling_shutter_parameters
+        );
+
+        auto [grad_transform_t, grad_transform_q] = shutter_pose.camera_ray_to_world_ray_backward(camera_ray.ray_dir, grad_world_ray_origin, grad_world_ray_dir); 
+
+        auto [grad_q_start, grad_t_start, grad_q_end, grad_t_end] = interpolate_shutter_pose_backward(
+            t_rel, rolling_shutter_parameters, grad_transform_t, grad_transform_q
+        );
+
+        return {grad_q_start, grad_t_start, grad_q_end, grad_t_end};
+    }
+
 
     struct ImagePointReturn {
         glm::fvec2 imagePoint;

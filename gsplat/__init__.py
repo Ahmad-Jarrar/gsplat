@@ -24,6 +24,7 @@ from .exporter import export_splats
 from .optimizers import SelectiveAdam
 from .rendering import (
     rasterization,
+    _rasterization,
     rasterization_2dgs,
     rasterization_2dgs_inria_wrapper,
     rasterization_inria_wrapper,
@@ -37,6 +38,7 @@ all = [
     "MCMCStrategy",
     "Strategy",
     "rasterization",
+    "_rasterization",
     "rasterization_2dgs",
     "rasterization_inria_wrapper",
     "spherical_harmonics",
