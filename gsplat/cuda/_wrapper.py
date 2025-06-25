@@ -656,7 +656,7 @@ def rasterize_to_pixels_eval3d(
     # distortion
     radial_coeffs: Optional[Tensor] = None,  # [..., C, 6] or [..., C, 4]
     tangential_coeffs: Optional[Tensor] = None,  # [..., C, 2]
-    thin_prism_coeffs: Optional[Tensor] = None,  # [..., C, 2]
+    thin_prism_coeffs: Optional[Tensor] = None,  # [..., C, 4]
     # rolling shutter
     rolling_shutter: RollingShutterType = RollingShutterType.GLOBAL,
     viewmats_rs: Optional[Tensor] = None,  # [..., C, 4, 4]
@@ -715,7 +715,7 @@ def rasterize_to_pixels_eval3d(
         tangential_coeffs = tangential_coeffs.contiguous()
 
     if thin_prism_coeffs is not None:
-        assert thin_prism_coeffs.shape == batch_dims + (C, 2), thin_prism_coeffs.shape
+        assert thin_prism_coeffs.shape == batch_dims + (C, 4), thin_prism_coeffs.shape
         thin_prism_coeffs = thin_prism_coeffs.contiguous()
 
     if viewmats_rs is not None:
@@ -1130,7 +1130,7 @@ def fully_fused_projection_with_ut(
     # distortion
     radial_coeffs: Optional[Tensor] = None,  # [..., C, 6] or [..., C, 4]
     tangential_coeffs: Optional[Tensor] = None,  # [..., C, 2]
-    thin_prism_coeffs: Optional[Tensor] = None,  # [..., C, 2]
+    thin_prism_coeffs: Optional[Tensor] = None,  # [..., C, 4]
     # rolling shutter
     rolling_shutter: RollingShutterType = RollingShutterType.GLOBAL,
     viewmats_rs: Optional[Tensor] = None,  # [..., C, 4, 4]
@@ -1160,7 +1160,7 @@ def fully_fused_projection_with_ut(
     if tangential_coeffs is not None:
         assert tangential_coeffs.shape == batch_dims + (C, 2), tangential_coeffs.shape
     if thin_prism_coeffs is not None:
-        assert thin_prism_coeffs.shape == batch_dims + (C, 2), thin_prism_coeffs.shape
+        assert thin_prism_coeffs.shape == batch_dims + (C, 4), thin_prism_coeffs.shape
     if viewmats_rs is not None:
         assert viewmats_rs.shape == batch_dims + (C, 4, 4), viewmats_rs.shape
 
@@ -1352,7 +1352,7 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
         # distortion
         radial_coeffs: Optional[Tensor] = None,  # [..., C, 6] or [..., C, 4]
         tangential_coeffs: Optional[Tensor] = None,  # [..., C, 2]
-        thin_prism_coeffs: Optional[Tensor] = None,  # [..., C, 2]
+        thin_prism_coeffs: Optional[Tensor] = None,  # [..., C, 4]
         # rolling shutter
         rolling_shutter: RollingShutterType = RollingShutterType.GLOBAL,
         viewmats_rs: Optional[Tensor] = None,  # [..., C, 4, 4]
