@@ -548,7 +548,7 @@ def test_rasterize_to_pixels(test_data, channels: int, batch_dims: Tuple[int, ..
     backgrounds.requires_grad = True
 
     # forward
-    render_colors, render_alphas = rasterize_to_pixels(
+    render_colors, render_alphas, n_touched = rasterize_to_pixels(
         means2d,
         conics,
         colors,
@@ -560,7 +560,7 @@ def test_rasterize_to_pixels(test_data, channels: int, batch_dims: Tuple[int, ..
         flatten_ids,
         backgrounds=backgrounds,
     )
-    _render_colors, _render_alphas = _rasterize_to_pixels(
+    _render_colors, _render_alphas, _n_touched = _rasterize_to_pixels(
         means2d,
         conics,
         colors,
@@ -574,7 +574,7 @@ def test_rasterize_to_pixels(test_data, channels: int, batch_dims: Tuple[int, ..
     )
     torch.testing.assert_close(render_colors, _render_colors)
     torch.testing.assert_close(render_alphas, _render_alphas)
-
+    torch.testing.assert_close(n_touched, _n_touched)
     # backward
     v_render_colors = torch.randn_like(render_colors)
     v_render_alphas = torch.randn_like(render_alphas)
